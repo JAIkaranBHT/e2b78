@@ -125,4 +125,4 @@ app.get("/sandboxes/:id/host", async (req, res) => {
 
 const port = Number(process.env.PORT || 8080);
 app.listen(port, () => {
-  console.log(`e2b-proxy listening on :${port}`);
+  console.log(`e2b-proxy listening on :${port}`);})
