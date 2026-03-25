@@ -6,7 +6,6 @@ const app = express();
 
 app.use(express.json({ limit: "10mb" }));
 
-// You can tighten this later (recommended).
 app.use(
   cors({
     origin: "*",
@@ -23,29 +22,37 @@ function requireEnv(name) {
   return v;
 }
 
+// ─── Health Check ───
 app.get("/health", (_req, res) => {
   res.json({ ok: true });
 });
+
+// ─── Create Sandbox ───
 app.post("/sandboxes", async (req, res) => {
   try {
     const apiKey = requireEnv("E2B_API_KEY");
     const { timeoutMs, metadata, envVars, template } = req.body || {};
+
+    // Use template from request body, or fall back to E2B_TEMPLATE env var
+    const tpl = template || process.env.E2B_TEMPLATE || undefined;
 
     const sandbox = await Sandbox.create({
       apiKey,
       timeoutMs: typeof timeoutMs === "number" ? timeoutMs : 5 * 60 * 1000,
       metadata: metadata || {},
       envs: envVars || {},
-      // template is optional in SDK; if you use custom templates, handle it here
-      // template: template || undefined,
+      ...(tpl ? { template: tpl } : {}),
     });
 
+    console.log(`Sandbox created: ${sandbox.sandboxId} (template: ${tpl || "default"})`);
     res.json({ sandboxId: sandbox.sandboxId });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: e?.message || "Create sandbox failed" });
   }
 });
+
+// ─── Run Command ───
 app.post("/sandboxes/:id/run", async (req, res) => {
   try {
     const apiKey = requireEnv("E2B_API_KEY");
@@ -70,7 +77,8 @@ app.post("/sandboxes/:id/run", async (req, res) => {
       envs: envs || {},
       timeoutMs: typeof timeoutMs === "number" ? timeoutMs : 60_000,
     });
-     res.json({
+
+    res.json({
       exitCode: result.exitCode,
       stdout: result.stdout,
       stderr: result.stderr,
@@ -81,8 +89,7 @@ app.post("/sandboxes/:id/run", async (req, res) => {
   }
 });
 
-// POST /sandboxes/:id/files
-// body: { files: [{ path, content }] }
+// ─── Write Files ───
 app.post("/sandboxes/:id/files", async (req, res) => {
   try {
     const apiKey = requireEnv("E2B_API_KEY");
@@ -90,6 +97,7 @@ app.post("/sandboxes/:id/files", async (req, res) => {
 
     const files = Array.isArray(req.body?.files) ? req.body.files : null;
     if (!files?.length) return res.status(400).json({ error: "Missing files" });
+
     const sandbox = await Sandbox.connect(sandboxId, { apiKey });
 
     for (const f of files) {
@@ -106,7 +114,26 @@ app.post("/sandboxes/:id/files", async (req, res) => {
   }
 });
 
-// GET /sandboxes/:id/host?port=3000
+// ─── Read File ───
+app.post("/sandboxes/:id/files/read", async (req, res) => {
+  try {
+    const apiKey = requireEnv("E2B_API_KEY");
+    const sandboxId = req.params.id;
+    const { path } = req.body || {};
+
+    if (!path) return res.status(400).json({ error: "Missing path" });
+
+    const sandbox = await Sandbox.connect(sandboxId, { apiKey });
+    const content = await sandbox.files.read(path);
+
+    res.json({ ok: true, content: content.toString() });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e?.message || "Read file failed" });
+  }
+});
+
+// ─── Get Host URL ───
 app.get("/sandboxes/:id/host", async (req, res) => {
   try {
     const apiKey = requireEnv("E2B_API_KEY");
@@ -116,13 +143,43 @@ app.get("/sandboxes/:id/host", async (req, res) => {
     const sandbox = await Sandbox.connect(sandboxId, { apiKey });
     const host = sandbox.getHost(port);
     const url = `https://${host}`;
-     res.json({ host, url, port });
+
+    res.json({ host, url, port });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: e?.message || "Host failed" });
   }
 });
 
+// ─── List Running Sandboxes ───
+app.get("/sandboxes", async (_req, res) => {
+  try {
+    const apiKey = requireEnv("E2B_API_KEY");
+    const sandboxes = await Sandbox.list({ apiKey });
+    res.json({ sandboxes: sandboxes.map(s => ({ sandboxId: s.sandboxId, startedAt: s.startedAt })) });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e?.message || "List failed" });
+  }
+});
+
+// ─── Kill Sandbox ───
+app.delete("/sandboxes/:id", async (req, res) => {
+  try {
+    const apiKey = requireEnv("E2B_API_KEY");
+    const sandboxId = req.params.id;
+    const sandbox = await Sandbox.connect(sandboxId, { apiKey });
+    await sandbox.kill();
+    console.log(`Sandbox killed: ${sandboxId}`);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e?.message || "Kill failed" });
+  }
+});
+
 const port = Number(process.env.PORT || 8080);
 app.listen(port, () => {
-  console.log(`e2b-proxy listening on :${port}`);})
+  console.log(`e2b-proxy listening on :${port}`);
+  console.log(`E2B_TEMPLATE: ${process.env.E2B_TEMPLATE || "(not set)"}`);
+});
