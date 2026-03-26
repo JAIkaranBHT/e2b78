@@ -217,11 +217,16 @@ fi
 """
     await sandbox.files.write("/tmp/install.sh", install_script)
 
-    # ── 4. Fire install script in background (returns in < 1s) ──────────────
+    # ── 4. Fire install script via E2B's native background process ──────────
+    # background=True: E2B registers the process in its own daemon — it survives
+    # even if our SDK stream drops.  timeout=0: no stream deadline.
+    # We do NOT call handle.wait() — we poll /tmp/install.done instead.
     logger.info("Starting background install in %s...", sandbox.sandbox_id)
-    await _run(sandbox,
-        "chmod +x /tmp/install.sh && rm -f /tmp/install.done && "
-        "nohup bash /tmp/install.sh > /tmp/install.log 2>&1 &"
+    await _run(sandbox, "chmod +x /tmp/install.sh && rm -f /tmp/install.done")
+    await sandbox.commands.run(
+        "bash /tmp/install.sh > /tmp/install.log 2>&1",
+        background=True,
+        timeout=0,
     )
 
     # ── 5. Poll for install completion (each poll is a < 1s command) ─────────
