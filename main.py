@@ -72,6 +72,7 @@ _sandboxes: dict[str, dict[str, Any]] = {}
 _pool: asyncio.Queue[PooledSandbox] = asyncio.Queue()
 _pool_assigned: dict[str, PooledSandbox] = {}   # sandbox_id → PooledSandbox
 _pool_available: list[PooledSandbox] = []        # mirrors queue for keepalive
+_pool_in_flight: int = 0                         # bootstraps currently in progress
 
 
 @asynccontextmanager
@@ -153,37 +154,29 @@ async def forward_to_sandbox(sandbox_id: str, path: str, body: dict, timeout: fl
 SANDBOX_CODE_DIR = Path(__file__).parent / "sandbox_runtime"
 
 
+async def _run(sandbox, cmd: str, timeout: int = 15) -> Any:
+    """Run a short-lived command with an explicit timeout. Never blocks > timeout seconds."""
+    return await sandbox.commands.run(cmd, timeout=timeout)
+
+
 async def bootstrap_e2b(sandbox) -> tuple[str, str]:
     """Bootstrap sandbox runtime into an E2B sandbox.
 
     Returns (runtime_url, vnc_url).
-    Skips installs that are already present in the E2B template.
+
+    All slow installs (pip, apt-get, wget) run as a nohup background script so
+    no SDK command ever blocks for more than ~15 seconds, completely avoiding
+    'context deadline exceeded' from E2B's HTTP streaming connection limits.
     """
     YUA_DIR = "/home/user/yua"
+    cdp_port = "9222"
 
-    # ── 1. Python dependencies (skip if template already has them) ───────────
-    r = await sandbox.commands.run(
-        "python3 -c 'import fastapi, uvicorn, httpx, websockets, aiofiles, pydantic' "
-        "2>/dev/null && echo FOUND || echo MISSING"
-    )
-    if "FOUND" not in r.stdout:
-        logger.info("Installing Python deps in sandbox %s...", sandbox.sandbox_id)
-        r = await sandbox.commands.run(
-            "pip3 install --quiet fastapi 'uvicorn[standard]' httpx websockets aiofiles "
-            "pydantic pydantic-settings beautifulsoup4 pillow",
-            timeout=0,
-        )
-        if r.exit_code != 0:
-            raise RuntimeError(f"pip install failed: {r.stderr}")
-    else:
-        logger.info("Python deps already present in template %s, skipping pip install", sandbox.sandbox_id)
-
-    # ── 2. Directory structure ────────────────────────────────────────────────
-    await sandbox.commands.run(
+    # ── 1. Directory structure ────────────────────────────────────────────────
+    await _run(sandbox,
         f"mkdir -p {YUA_DIR}/sandbox/browser/js {YUA_DIR}/sandbox/handlers {YUA_DIR}/sandbox/shell"
     )
 
-    # ── 3. Upload sandbox runtime files ──────────────────────────────────────
+    # ── 2. Upload sandbox runtime files ──────────────────────────────────────
     if SANDBOX_CODE_DIR.exists():
         logger.info("Uploading sandbox runtime to %s...", sandbox.sandbox_id)
         for local_path in SANDBOX_CODE_DIR.rglob("*"):
@@ -195,114 +188,131 @@ async def bootstrap_e2b(sandbox) -> tuple[str, str]:
     else:
         logger.warning("No sandbox_runtime/ directory — using template's built-in runtime")
 
-    # ── 4. Desktop tools (Xvfb, VNC) — skip if already in template ───────────
-    r = await sandbox.commands.run("which Xvfb 2>/dev/null && echo FOUND || echo MISSING")
-    if "FOUND" not in r.stdout:
-        logger.info("Installing desktop tools in %s...", sandbox.sandbox_id)
-        r = await sandbox.commands.run(
-            "sudo apt-get update -qq && "
-            "sudo apt-get install -y -qq xvfb x11vnc novnc websockify 2>&1 | tail -3",
-            timeout=0,
-        )
-        if r.exit_code != 0:
-            logger.warning("Desktop tools install failed: %s", r.stderr)
-    else:
-        logger.info("Xvfb already present in template %s, skipping apt-get", sandbox.sandbox_id)
+    # ── 3. Write install script to sandbox ──────────────────────────────────
+    # The script uses 'trap EXIT' so it always writes the exit code to
+    # /tmp/install.done, even on failure.  We then poll with short commands.
+    install_script = b"""#!/bin/bash
+trap 'echo $? > /tmp/install.done' EXIT
+set -e
 
-    # ── 5. Chrome — skip if already in template ───────────────────────────────
-    r = await sandbox.commands.run(
-        "(which google-chrome-stable 2>/dev/null || which google-chrome 2>/dev/null) && echo FOUND || echo MISSING"
+# ── Python deps ──────────────────────────────────────────────────────────────
+if ! python3 -c 'import fastapi,uvicorn,httpx,websockets,aiofiles,pydantic' 2>/dev/null; then
+    pip3 install --quiet fastapi 'uvicorn[standard]' httpx websockets aiofiles \
+        pydantic pydantic-settings beautifulsoup4 pillow
+fi
+
+# ── Desktop tools (Xvfb, x11vnc, noVNC) ─────────────────────────────────────
+if ! which Xvfb >/dev/null 2>&1; then
+    apt-get update -qq
+    apt-get install -y -qq xvfb x11vnc novnc websockify
+fi
+
+# ── Chrome browser ────────────────────────────────────────────────────────────
+if ! which google-chrome-stable >/dev/null 2>&1 && ! which google-chrome >/dev/null 2>&1; then
+    wget -q -O /tmp/chrome.deb \
+        https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+    apt-get install -y -qq /tmp/chrome.deb
+    rm -f /tmp/chrome.deb
+fi
+"""
+    await sandbox.files.write("/tmp/install.sh", install_script)
+
+    # ── 4. Fire install script in background (returns in < 1s) ──────────────
+    logger.info("Starting background install in %s...", sandbox.sandbox_id)
+    await _run(sandbox,
+        "chmod +x /tmp/install.sh && rm -f /tmp/install.done && "
+        "nohup bash /tmp/install.sh > /tmp/install.log 2>&1 &"
     )
-    if "FOUND" not in r.stdout:
-        logger.info("Installing Chrome in %s...", sandbox.sandbox_id)
-        r = await sandbox.commands.run(
-            "wget -q -O /tmp/chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb && "
-            "sudo apt-get install -y -qq /tmp/chrome.deb 2>&1 | tail -3 && "
-            "rm -f /tmp/chrome.deb",
-            timeout=0,
-        )
-        if r.exit_code != 0:
-            logger.warning("Chrome install failed: %s", r.stderr)
-    else:
-        logger.info("Chrome already present in template %s, skipping Chrome install", sandbox.sandbox_id)
 
-    # ── 6. Start Xvfb ─────────────────────────────────────────────────────────
-    await sandbox.commands.run(
-        "Xvfb :0 -ac -screen 0 1280x960x24 -nolisten tcp > /tmp/xvfb.log 2>&1 &",
-        timeout=5,
+    # ── 5. Poll for install completion (each poll is a < 1s command) ─────────
+    logger.info("Waiting for installs in %s (up to 10 min)...", sandbox.sandbox_id)
+    for attempt in range(120):   # 120 × 5 s = 10 minutes max
+        await asyncio.sleep(5)
+        r = await _run(sandbox, "cat /tmp/install.done 2>/dev/null || echo pending")
+        status = r.stdout.strip()
+        if status == "0":
+            logger.info(
+                "Installs done in %s after ~%ds", sandbox.sandbox_id, (attempt + 1) * 5
+            )
+            break
+        if status not in ("pending", ""):
+            r2 = await _run(sandbox, "tail -40 /tmp/install.log 2>/dev/null")
+            raise RuntimeError(
+                f"Install failed (exit {status}) in {sandbox.sandbox_id}:\n{r2.stdout}"
+            )
+    else:
+        r2 = await _run(sandbox, "tail -40 /tmp/install.log 2>/dev/null")
+        raise RuntimeError(
+            f"Install timed out after 10 min in {sandbox.sandbox_id}:\n{r2.stdout}"
+        )
+
+    # ── 6. Start Xvfb ────────────────────────────────────────────────────────
+    await _run(sandbox,
+        "Xvfb :0 -ac -screen 0 1280x960x24 -nolisten tcp > /tmp/xvfb.log 2>&1 &"
     )
     await asyncio.sleep(2)
 
     # ── 7. Start Chrome with CDP ──────────────────────────────────────────────
-    chrome_bin = "google-chrome-stable"
-    r = await sandbox.commands.run("which google-chrome-stable 2>/dev/null || echo google-chrome")
+    r = await _run(sandbox, "which google-chrome-stable 2>/dev/null || echo google-chrome")
     chrome_bin = r.stdout.strip() or "google-chrome-stable"
 
-    await sandbox.commands.run(
+    await _run(sandbox,
         f"export DISPLAY=:0 && {chrome_bin} "
         "--no-sandbox --disable-gpu --no-first-run --no-default-browser-check "
         "--password-store=basic --remote-debugging-port=9222 "
         "--remote-debugging-address=0.0.0.0 --user-data-dir=/tmp/chrome-data "
         "--force-device-scale-factor=0.8 --window-size=1280,960 "
         "--hide-crash-restore-bubble about:blank "
-        "> /tmp/chrome.log 2>&1 &",
-        timeout=5,
+        "> /tmp/chrome.log 2>&1 &"
     )
     await asyncio.sleep(5)
 
     # ── 8. Start VNC (x11vnc + websockify/noVNC) ──────────────────────────────
-    await sandbox.commands.run(
+    await _run(sandbox,
         "x11vnc -display :0 -nopw -listen 0.0.0.0 -rfbport 5900 -forever -shared -bg "
         "> /tmp/vnc.log 2>&1 && "
-        "websockify --web /usr/share/novnc 6080 localhost:5900 > /tmp/novnc.log 2>&1 &",
-        timeout=5,
+        "websockify --web /usr/share/novnc 6080 localhost:5900 > /tmp/novnc.log 2>&1 &"
     )
     await asyncio.sleep(2)
 
     # ── 9. Verify Chrome CDP ──────────────────────────────────────────────────
-    cdp_port = "9222"
-    for attempt in range(10):
-        r = await sandbox.commands.run(
+    for attempt in range(15):
+        r = await _run(sandbox,
             f"curl -s http://localhost:{cdp_port}/json/version >/dev/null 2>&1 && echo OK || echo WAIT"
         )
         if "OK" in r.stdout:
-            logger.info("Chrome CDP ready on port %s in sandbox %s", cdp_port, sandbox.sandbox_id)
+            logger.info("Chrome CDP ready in sandbox %s", sandbox.sandbox_id)
             break
         await asyncio.sleep(2)
 
     # ── 10. Get noVNC public URL ──────────────────────────────────────────────
     try:
-        vnc_host = sandbox.get_host(6080)
-        vnc_url = f"https://{vnc_host}/vnc.html"
+        vnc_url = f"https://{sandbox.get_host(6080)}/vnc.html"
         logger.info("VNC URL for %s: %s", sandbox.sandbox_id, vnc_url)
     except Exception:
         vnc_url = ""
 
     # ── 11. Start sandbox runtime ─────────────────────────────────────────────
     logger.info("Starting sandbox runtime in %s...", sandbox.sandbox_id)
-    await sandbox.commands.run(
+    await _run(sandbox,
         f"cd {YUA_DIR} && CDP_PORT={cdp_port} PYTHONPATH={YUA_DIR} "
         f"nohup python3 -m uvicorn sandbox.runtime:app "
         f"--host 0.0.0.0 --port {SANDBOX_RUNTIME_PORT} "
-        f"> /tmp/sandbox-runtime.log 2>&1 &",
-        timeout=10,
+        f"> /tmp/sandbox-runtime.log 2>&1 &"
     )
 
     # ── 12. Health check ──────────────────────────────────────────────────────
-    logger.info("Waiting for sandbox runtime health in %s...", sandbox.sandbox_id)
-    for _ in range(20):
-        await asyncio.sleep(1)
-        r = await sandbox.commands.run(
-            f"curl -s http://localhost:{SANDBOX_RUNTIME_PORT}/healthz"
-        )
+    logger.info("Waiting for runtime health in %s...", sandbox.sandbox_id)
+    for _ in range(30):
+        await asyncio.sleep(2)
+        r = await _run(sandbox, f"curl -s http://localhost:{SANDBOX_RUNTIME_PORT}/healthz")
         if '"status":"ok"' in r.stdout:
             logger.info("Sandbox %s runtime healthy!", sandbox.sandbox_id)
-            host = sandbox.get_host(SANDBOX_RUNTIME_PORT)
-            runtime_url = f"https://{host}"
+            runtime_url = f"https://{sandbox.get_host(SANDBOX_RUNTIME_PORT)}"
             return runtime_url, vnc_url
 
-    r = await sandbox.commands.run("cat /tmp/sandbox-runtime.log 2>/dev/null | tail -20")
-    logger.error("Runtime log: %s", r.stdout)
+    r = await _run(sandbox, "tail -30 /tmp/sandbox-runtime.log 2>/dev/null")
+    logger.error("Runtime log for %s: %s", sandbox.sandbox_id, r.stdout)
     raise RuntimeError(f"Sandbox {sandbox.sandbox_id} runtime failed to start")
 
 
@@ -322,22 +332,27 @@ async def _pool_start() -> None:
 
 async def _pool_bootstrap_one() -> PooledSandbox:
     """Create one E2B sandbox, bootstrap it, add to pool."""
+    global _pool_in_flight
     from e2b import AsyncSandbox
 
-    sandbox = await AsyncSandbox.create(
-        template=E2B_TEMPLATE,
-        api_key=E2B_API_KEY,
-        timeout=_SANDBOX_TIMEOUT,
-    )
+    _pool_in_flight += 1
     try:
-        runtime_url, vnc_url = await bootstrap_e2b(sandbox)
-    except Exception as e:
-        logger.error("Bootstrap failed for %s: %s", sandbox.sandbox_id, e)
+        sandbox = await AsyncSandbox.create(
+            template=E2B_TEMPLATE,
+            api_key=E2B_API_KEY,
+            timeout=_SANDBOX_TIMEOUT,
+        )
         try:
-            await sandbox.kill()
-        except Exception:
-            pass
-        raise
+            runtime_url, vnc_url = await bootstrap_e2b(sandbox)
+        except Exception as e:
+            logger.error("Bootstrap failed for %s: %s", sandbox.sandbox_id, e)
+            try:
+                await sandbox.kill()
+            except Exception:
+                pass
+            raise
+    finally:
+        _pool_in_flight -= 1
 
     sb = PooledSandbox(
         sandbox_id=sandbox.sandbox_id,
@@ -374,20 +389,26 @@ async def _pool_refill_loop() -> None:
             await asyncio.sleep(5)
             available = _pool.qsize()
             assigned = len(_pool_assigned)
-            total = available + assigned
+            in_flight = _pool_in_flight
+            total = available + assigned + in_flight
             if total < _POOL_SIZE:
                 deficit = _POOL_SIZE - total
                 logger.info(
-                    "Pool below target (%d/%d), bootstrapping %d replacement(s)...",
-                    total, _POOL_SIZE, deficit,
+                    "Pool below target (%d/%d, %d in-flight), bootstrapping %d replacement(s)...",
+                    available + assigned, _POOL_SIZE, in_flight, deficit,
                 )
                 for _ in range(deficit):
-                    try:
-                        await _pool_bootstrap_one()
-                    except Exception as e:
-                        logger.error("Failed to bootstrap replacement: %s", e)
+                    asyncio.create_task(_pool_bootstrap_one_safe())
         except Exception as e:
             logger.error("Refill loop error: %s", e)
+
+
+async def _pool_bootstrap_one_safe() -> None:
+    """Fire-and-forget wrapper that logs errors."""
+    try:
+        await _pool_bootstrap_one()
+    except Exception as e:
+        logger.error("Failed to bootstrap replacement: %s", e)
 
 
 async def _kill_sandbox(sb: PooledSandbox) -> None:
