@@ -6,15 +6,19 @@ services:
     plan: starter
     envVars:
       - key: E2B_API_KEY
-        sync: false  # Set manually in Render dashboard
+        sync: false
       - key: E2B_TEMPLATE
         value: xv9t5sqco7pw40w8flyb
       - key: PROXY_SIGNATURE
         value: O3I3Eo1ZphHkfZolPCg81HXvVJVr5m7h
       - key: TAVILY_API_KEY
-        sync: false  # Set manually in Render dashboard
+        sync: false
       - key: RORK_IMAGE_URL
         value: https://toolkit.rork.com/images/generate/
       - key: RORK_IMAGE_EDIT_URL
         value: https://toolkit.rork.com/images/edit/
+      - key: WARM_POOL_SIZE
+        value: "3"
+      - key: WARM_POOL_REUSE_MODE
+        value: reset
     healthCheckPath: /health
