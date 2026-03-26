@@ -171,7 +171,7 @@ async def bootstrap_e2b(sandbox) -> tuple[str, str]:
         r = await sandbox.commands.run(
             "pip3 install --quiet fastapi 'uvicorn[standard]' httpx websockets aiofiles "
             "pydantic pydantic-settings beautifulsoup4 pillow",
-            timeout=120,
+            timeout=0,
         )
         if r.exit_code != 0:
             raise RuntimeError(f"pip install failed: {r.stderr}")
@@ -202,7 +202,7 @@ async def bootstrap_e2b(sandbox) -> tuple[str, str]:
         r = await sandbox.commands.run(
             "sudo apt-get update -qq && "
             "sudo apt-get install -y -qq xvfb x11vnc novnc websockify 2>&1 | tail -3",
-            timeout=180,
+            timeout=0,
         )
         if r.exit_code != 0:
             logger.warning("Desktop tools install failed: %s", r.stderr)
@@ -211,7 +211,7 @@ async def bootstrap_e2b(sandbox) -> tuple[str, str]:
 
     # ── 5. Chrome — skip if already in template ───────────────────────────────
     r = await sandbox.commands.run(
-        "which google-chrome-stable 2>/dev/null || which google-chrome 2>/dev/null && echo FOUND || echo MISSING"
+        "(which google-chrome-stable 2>/dev/null || which google-chrome 2>/dev/null) && echo FOUND || echo MISSING"
     )
     if "FOUND" not in r.stdout:
         logger.info("Installing Chrome in %s...", sandbox.sandbox_id)
@@ -219,7 +219,7 @@ async def bootstrap_e2b(sandbox) -> tuple[str, str]:
             "wget -q -O /tmp/chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb && "
             "sudo apt-get install -y -qq /tmp/chrome.deb 2>&1 | tail -3 && "
             "rm -f /tmp/chrome.deb",
-            timeout=180,
+            timeout=0,
         )
         if r.exit_code != 0:
             logger.warning("Chrome install failed: %s", r.stderr)
